@@ -1,20 +1,23 @@
-Cell library definition inventory (initial version)
+Cell library model and geometry inspector (v2)
 
-This script uses the third-party ezdgn V8 reader, not MicroStation's embedded Python API.
-It can run with system Python, including Python 3.14, subject to ezdgn installation.
-
-Install:
+Requirements:
   python -m pip install ezdgn
 
-Run:
-  python extract_cell_definitions.py "C:\path\to\TURNOUT .cel"
+Usage (Git Bash / Windows):
+  python extract_cell_definitions.py "C:\\path\\to\\TURNOUT .cel"
 
-Optional output:
-  python extract_cell_definitions.py "C:\path\to\TURNOUT .cel" -o turnout_definitions.csv
+Optional output prefix:
+  python extract_cell_definitions.py "C:\\path\\to\\TURNOUT .cel" -o turnout
 
-The CSV inventories model names, dimensions, master units, and entity counts.
-A cell library can also contain non-cell models. The script does not validate
-cell types, export geometry, or modify source files.
+Outputs:
+  turnout_definitions.csv   - model inventory, entity types, geometry coverage
+  turnout_geometry.json    - recursive entity tree and exposed properties
 
-The third-party reader is early-stage software; verify results by comparing
-model names with MicroStation 2025's cell library interface.
+Notes:
+- Read-only: does not modify the CEL library.
+- Coordinates are raw values exposed by ezdgn. No transforms are applied.
+- Geometry detection is best-effort and does not guarantee a complete shape.
+- Unresolved leaves are flagged in JSON and counted in CSV.
+- This version has been syntax-checked but not run against ezdgn in this environment.
+- If all elements remain unresolved, the Bentley MicroStation Python API is
+  likely necessary for reliable extraction of DGN complex geometry.
