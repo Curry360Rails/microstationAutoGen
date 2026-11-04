@@ -1,11 +1,16 @@
-"""MicroStation 2025 Python Manager: connected OSM chains and sampled circular bends.
+"""MicroStation 2025 Python Manager: import prepared OSM chains.
 
-Input: railway_chains_v3.json beside this script, EPSG:26911 meters.
-Diagnostic default: insert only ONE line-string element into a NEW writable DGN.
-No turnout cells are inserted and no centerlines are trimmed.
+Options: -c native circular arcs, -s prepared clothoid spirals, -c -s both.
+Without flags, only straight line-string pieces are drawn (arc/spiral pieces
+are represented by their endpoint chords). Spiral pieces must have fitted
+start bearing, start/end curvature, length, and placement frame metadata.
+
+Run in a NEW DGN. Verify model GCS EPSG:26911 and meter storage units.
 """
+import argparse
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -13,173 +18,154 @@ PLAN = Path(__file__).with_name('railway_chains_v3.json')
 DRY_RUN = False
 CONFIRM_METERS_AND_EPSG_26911 = True
 MAX_PIECES = None
-DRAW_SWITCH_MARKERS = False
-ARC_MAX_CHORD_METERS = 2.0
-LOCAL_ORIGIN_METERS = None
-PROGRESS_EVERY = 1
-VERBOSE_API_LOG = True
-PROGRESS_BAR_WIDTH = 30
+PROGRESS_EVERY = 10
 
 
-def sample_arc(piece, max_chord):
-    center = piece['center']
-    radius = float(piece['radius_m'])
-    start = piece['start']
-    sweep = float(piece['sweep_rad'])
-    if max_chord <= 0 or radius <= 0:
-        raise ValueError('Arc radius and maximum chord must be positive')
-    angle = math.atan2(start[1] - center[1], start[0] - center[0])
-    count = max(2, int(math.ceil(abs(sweep) * radius / max_chord)))
-    points = [[center[0] + radius * math.cos(angle + sweep * i / count),
-               center[1] + radius * math.sin(angle + sweep * i / count)]
-              for i in range(count + 1)]
-    points[0] = start
-    points[-1] = piece['end']
-    return points
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('-c', '--curves', action='store_true', help='Write native circular ARC primitives')
+    p.add_argument('-s', '--spirals', action='store_true', help='Write native fitted clothoid primitives')
+    p.add_argument('--plan', type=Path, default=PLAN)
+    p.add_argument('--write', action='store_true', help='Write to active DGN (requires confirmation constant)')
+    p.add_argument('--max-pieces', type=int, default=MAX_PIECES)
+    # Python Manager may inject arguments: parse only known args.
+    args, unknown = p.parse_known_args()
+    if unknown:
+        print('Ignored unknown Python Manager arguments:', unknown, flush=True)
+    return args
 
 
-def progress(done, total, start_time, label='Drawing', force=False):
-    if not force and done != total and done % max(1, PROGRESS_EVERY):
-        return
-    elapsed = time.monotonic() - start_time
-    fraction = done / total if total else 1.0
-    filled = round(PROGRESS_BAR_WIDTH * fraction)
-    bar = '#' * filled + '-' * (PROGRESS_BAR_WIDTH - filled)
-    eta = elapsed / done * (total - done) if done else 0.0
-    print(f'{label} [{bar}] {done}/{total} ({fraction:.1%}) '
-          f'elapsed={elapsed:.1f}s ETA={eta:.1f}s', flush=True)
-
-
-def status_is_success(status):
-    """Compare Bentley's enum directly; support a numeric success result as fallback."""
-    try:
-        from MSPyBentley import BentleyStatus
-        return status == BentleyStatus.eSUCCESS
-    except ImportError:
-        # Do not depend on int(enum) working on all Bentley bindings.
-        return str(status) in ('BentleyStatus.eSUCCESS', '0')
+def success(value):
+    if value is None:
+        return True
+    return str(value) in ('0', 'BentleyStatus.eSUCCESS', 'eSUCCESS') or value == 0
 
 
 def run():
-    from MSPyMstnPlatform import ISessionMgr
-    from MSPyDgnPlatform import EditElementHandle, LineStringHandler
-    from MSPyBentleyGeom import DPoint3d, DPoint3dArray
-
-    data = json.loads(PLAN.read_text(encoding='utf-8'))
+    args = parse_args()
+    data = json.loads(args.plan.read_text(encoding='utf-8'))
     if data.get('schema') != 'osm_microstation_v3' or data.get('crs_epsg') != 26911:
         raise ValueError('Expected osm_microstation_v3 EPSG:26911 plan')
-
-    print('Before GetActiveDgnModelRef', flush=True)
-    try:
-        ref = ISessionMgr.GetActiveDgnModelRef()
-    except Exception as exc:
-        print(
-            "GetActiveDgnModelRef failed:",
-            type(exc).__name__,
-            str(exc),
-            flush=True
-        )
-        raise
-    print('After GetActiveDgnModelRef', flush=True)
-    if ref is None:
-        raise RuntimeError('No active DGN model reference')
-
-    print('Before GetDgnModel', flush=True)
-    model = ref.GetDgnModel()
-    print('After GetDgnModel', flush=True)
-    if model is None:
-        raise RuntimeError('No active DGN model')
-    info = model.GetModelInfo()
-    factor = float(info.GetUorPerStorage())
-    print('Model:', model.GetModelName(), flush=True)
-    print('UOR per storage:', factor, 'chains:', data['stats']['chains'],
-          'pieces:', data['stats']['drawing_pieces'], flush=True)
-    print('Sampled circular pieces:', data['stats']['fitted_arc_pieces'], flush=True)
-    print('Origin offset:', LOCAL_ORIGIN_METERS, flush=True)
-    if DRY_RUN:
-        print('DRY RUN: no geometry created', flush=True)
+    pieces = [(chain.get('chain_id'), piece) for chain in data['chains'] for piece in chain['pieces']]
+    if args.max_pieces is not None:
+        if args.max_pieces < 1:
+            raise ValueError('--max-pieces must be positive')
+        pieces = pieces[:args.max_pieces]
+    counts = {'line_string': 0, 'arc': 0, 'spiral': 0}
+    for _, piece in pieces:
+        counts[piece['type']] = counts.get(piece['type'], 0) + 1
+    print('Plan:', args.plan, 'Pieces:', len(pieces), 'Types:', counts, flush=True)
+    print('Native arcs:', args.curves, 'Native spirals:', args.spirals, flush=True)
+    if DRY_RUN or not args.write:
+        print('DRY RUN: no geometry created. Set DRY_RUN=False, confirmation=True and use --write.', flush=True)
         return
     if not CONFIRM_METERS_AND_EPSG_26911:
-        raise RuntimeError('Confirm meter storage units and destination GCS first')
+        raise RuntimeError('Confirm DGN storage units are meters and GCS is EPSG:26911 in script first')
 
-    def create_line_string(points):
-        if len(points) < 2:
-            return
-        arr = DPoint3dArray()
-        ox, oy = LOCAL_ORIGIN_METERS if LOCAL_ORIGIN_METERS is not None else (0.0, 0.0)
-        for p in points:
-            arr.append(DPoint3d((float(p[0]) - ox) * factor,
-                                (float(p[1]) - oy) * factor, 0.0))
-        handle = EditElementHandle()
-        if VERBOSE_API_LOG:
-            print('Before CreateLineStringElement', len(points), 'points', flush=True)
-        status = LineStringHandler.CreateLineStringElement(handle, None, arr, ref.Is3d(), ref)
-        if VERBOSE_API_LOG:
-            print('After CreateLineStringElement', status, flush=True)
-        if not status_is_success(status):
-            raise RuntimeError('LineString creation failed: ' + str(status))
-        if VERBOSE_API_LOG:
-            print('Before AddToModel', flush=True)
-        result = handle.AddToModel()
-        if VERBOSE_API_LOG:
-            print('After AddToModel', result, flush=True)
-        if result is not None and result != 0:
+    # Import all Bentley modules before accessing model ref; Python Manager
+    # bindings sometimes fail converting DgnModelRef without the type registered.
+    import MSPyDgnPlatform
+    import MSPyBentleyGeom
+    from MSPyMstnPlatform import ISessionMgr
+    from MSPyDgnPlatform import DraftingElementSchema, EditElementHandle
+    from MSPyBentleyGeom import DPoint3d, DSegment3d, DEllipse3d, ICurvePrimitive
+
+    ref = ISessionMgr.GetActiveDgnModelRef()
+    if ref is None or ref.GetDgnModel() is None:
+        raise RuntimeError('Open a writable destination DGN in MicroStation Python Manager')
+    model = ref.GetDgnModel()
+    factor = float(model.GetModelInfo().GetUorPerStorage())
+    print('Model:', model.GetModelName(), 'UOR/storage:', factor, flush=True)
+
+    def pt(p):
+        return DPoint3d(float(p[0]) * factor, float(p[1]) * factor, 0.0)
+
+    def line_primitive(a, b):
+        return ICurvePrimitive.CreateLine(DSegment3d(pt(a), pt(b)))
+
+    def arc_primitive(piece):
+        # Use documented ArcHandler directly for native ARC_ELM, rather than
+        # relying on undocumented DEllipse3d constructors.
+        from MSPyDgnPlatform import ArcHandler
+        center = pt(piece['center'])
+        radius = float(piece['radius_m']) * factor
+        start = piece['start']
+        angle = math.atan2(start[1] - piece['center'][1], start[0] - piece['center'][0])
+        sweep = float(piece['sweep_rad'])
+        eeh = EditElementHandle()
+        status = ArcHandler.CreateArcElement(eeh, None, center, radius, radius,
+                                             0.0, angle, sweep, ref.Is3d(), ref)
+        if not success(status):
+            raise RuntimeError('CreateArcElement failed: ' + str(status))
+        result = eeh.AddToModel()
+        if not success(result):
             raise RuntimeError('AddToModel failed: ' + str(result))
 
-    total_track_elements = 0
-    for chain in data['chains']:
-        for piece in chain['pieces']:
-            n = (len(piece['points']) if piece['type'] == 'line_string'
-                 else len(sample_arc(piece, ARC_MAX_CHORD_METERS)))
-            if n >= 2:
-                total_track_elements += (n - 2) // 99 + 1
-    total_markers = (2 * sum(bool(sw.get('tagged')) for sw in data['switches'])
-                     if DRAW_SWITCH_MARKERS else 0)
-    total_elements = total_track_elements + total_markers
-    if MAX_PIECES is not None:
-        total_elements = min(total_elements, MAX_PIECES)
-    print('Planned MicroStation elements:', total_elements, flush=True)
+    def write_primitive(primitive):
+        if primitive is None:
+            raise RuntimeError('Curve primitive factory returned None')
+        eeh = EditElementHandle()
+        status = DraftingElementSchema.ToElement(eeh, primitive, None, ref.Is3d(), ref)
+        if not success(status):
+            raise RuntimeError('DraftingElementSchema.ToElement failed: ' + str(status))
+        result = eeh.AddToModel()
+        if not success(result):
+            raise RuntimeError('AddToModel failed: ' + str(result))
+
+    def spiral_primitive(piece):
+        # Required prepared metadata: a transform placing the spiral origin,
+        # plus signed curvature, bearing and length. Do not infer these from
+        # circular arc center/sweep: that would shift the track alignment.
+        required = ('start_bearing_rad', 'start_curvature_per_m',
+                    'end_curvature_per_m', 'length_m', 'origin')
+        missing = [key for key in required if key not in piece]
+        if missing:
+            raise ValueError('Spiral piece missing fitted parameters: ' + ', '.join(missing))
+        from MSPyBentleyGeom import Transform, DSpiral2dClothoid
+        # Bentley Transform constructor/placement overload must be verified
+        # before using this path. Fail explicitly instead of writing an
+        # unpositioned native spiral at (0,0).
+        raise NotImplementedError(
+            'Native spiral placement frame is not verified for this MicroStation '
+            'build. No spiral written; supply documented Transform placement overload.')
+
     started = time.monotonic()
     made = 0
-    progress(0, total_elements, started, force=True)
-
-    for chain in data['chains']:
-        for piece in chain['pieces']:
-            pts = (piece['points'] if piece['type'] == 'line_string'
-                   else sample_arc(piece, ARC_MAX_CHORD_METERS))
-            for i in range(0, len(pts) - 1, 99):
-                chunk = pts[i:i + 100]
-                if len(chunk) < 2:
-                    continue
-                try:
-                    create_line_string(chunk)
-                except Exception as exc:
-                    raise RuntimeError('Chain %s, piece %s failed after %s elements; '
-                                       'do not rerun in same DGN: %s'
-                                       % (chain['chain_id'], piece['type'], made, exc)) from exc
+    for chain_id, piece in pieces:
+        kind = piece['type']
+        try:
+            if kind == 'line_string':
+                pts = piece['points']
+                # Straight-only mode preserves each original polyline segment.
+                # Bentley CreateLine uses a native LINE primitive.
+                for a, b in zip(pts, pts[1:]):
+                    if math.dist(a[:2], b[:2]) > 1e-8:
+                        write_primitive(line_primitive(a, b))
+                        made += 1
+            elif kind in ('arc', 'circular_arc'):
+                if args.curves:
+                    arc_primitive(piece)
+                else:
+                    write_primitive(line_primitive(piece['start'], piece['end']))
                 made += 1
-                progress(made, total_elements, started)
-                if MAX_PIECES is not None and made >= MAX_PIECES:
-                    print('Stopped at MAX_PIECES:', made, flush=True)
-                    return
-
-    if DRAW_SWITCH_MARKERS:
-        for sw in data['switches']:
-            if not sw.get('tagged'):
-                continue
-            x, y = sw['point'][:2]
-            s = 2.0
-            for marker in ([[x - s, y - s], [x + s, y + s]],
-                           [[x - s, y + s], [x + s, y - s]]):
-                create_line_string(marker)
+            elif kind == 'spiral':
+                if args.spirals:
+                    write_primitive(spiral_primitive(piece))
+                else:
+                    write_primitive(line_primitive(piece['start'], piece['end']))
                 made += 1
-                progress(made, total_elements, started)
-                if MAX_PIECES is not None and made >= MAX_PIECES:
-                    print('Stopped at MAX_PIECES:', made, flush=True)
-                    return
-    progress(made, total_elements, started, force=True)
-    print('Completed line-string elements:', made, flush=True)
-    print('No turnout cells placed; sampled arcs are line strings, not native ARC entities.', flush=True)
+            else:
+                raise ValueError('Unknown piece type: ' + str(kind))
+        except Exception as exc:
+            raise RuntimeError(f'Chain {chain_id} piece {kind} failed after {made} elements. '
+                               'Do not rerun in same DGN (duplicates).') from exc
+        done = pieces.index((chain_id, piece)) + 1
+        if done % PROGRESS_EVERY == 0 or done == len(pieces):
+            elapsed = time.monotonic() - started
+            eta = elapsed / done * (len(pieces) - done)
+            print(f'[{done}/{len(pieces)}] {done/len(pieces):.1%} '
+                  f'created={made} elapsed={elapsed:.1f}s ETA={eta:.1f}s', flush=True)
+    print('Finished. Elements created:', made, flush=True)
 
 
 if __name__ == '__main__':
