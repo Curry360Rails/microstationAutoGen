@@ -1,0 +1,10 @@
+{
+  "switches": 109,
+  "ranked": 107,
+  "unresolved": 2,
+  "catalog_models": 103,
+  "scale_m_per_raw": 3.048006096012192e-05,
+  "scale_assumption": "raw coordinates interpreted as UOR; master unit from metadata; NOT verified",
+  "method": "local branch profile vs circular candidate, toe-offset search; approximate, not full CAD registration",
+  "projection": "EPSG:26911"
+}

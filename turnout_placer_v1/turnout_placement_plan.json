@@ -1,0 +1,20 @@
+{
+  "epsg": 26911,
+  "source": "C:\\scripts\\microS\\microAutoGen\\newnew\\railway_raw_osm.json",
+  "placements": [
+    {
+      "node_id": 54181094,
+      "x_m": 472252.3088818225,
+      "y_m": 3824074.3433622406,
+      "model": "11 RHII",
+      "ranked_confidence": "unverified",
+      "ranked_rmse_m": "0.132",
+      "status": "awaiting_verified_anchor",
+      "through_bearing_rad": -2.1393404479004516,
+      "branch_bearing_rad": -2.233178046490241,
+      "hand_observed": "RH",
+      "branch_angle_deg": 5.3764983588377016,
+      "through_opposition_error_deg": 1.396316659155355
+    }
+  ]
+}
