@@ -267,19 +267,122 @@ def geometry_stats(model):
                 samples.extend(g.get('sampled_xyz',[]))
     return lines,arcs,samples
 
+def _cross2(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _intersection(a, b, c, d):
+    """Intersection of infinite AB and CD, including segment parameters."""
+    u = (b[0]-a[0], b[1]-a[1])
+    v = (d[0]-c[0], d[1]-c[1])
+    den = _cross2(u, v)
+    if abs(den) < 1e-10 * max(1.0, math.hypot(*u)*math.hypot(*v)):
+        return None
+    delta = (c[0]-a[0], c[1]-a[1])
+    t = _cross2(delta, v) / den
+    w = _cross2(delta, u) / den
+    return (a[0]+t*u[0], a[1]+t*u[1], t, w)
+
+
 def estimate_anchor(model):
-    """Heuristic only: midpoint of longest extracted straight line, NOT verified PS."""
-    lines,_,_=geometry_stats(model)
-    segments=[]
-    for pts in lines:
-        for a,b in zip(pts,pts[1:]):
-            length=distance(a,b)
-            if length>0:segments.append((length,a,b))
-    if not segments:return None
-    _,a,b=max(segments,key=lambda x:x[0])
-    return {'toe_xy_raw':[float(a[0]),float(a[1])],
-            'through_bearing_deg':math.degrees(math.atan2(b[1]-a[1],b[0]-a[0])),
-            'method':'longest_line_endpoint_HEURISTIC_NOT_VERIFIED'}
+    """Anchor at the symbol's perpendicular stem/through-axis intersection.
+
+    Circle: stem bisects the circle. Triangle: stem is the vertical side.
+    Work in raw extracted cell coordinates; no assumed real-world scale.
+    """
+    def descendants(element):
+        yield element
+        for child in element.get('children', []):
+            yield from descendants(child)
+
+    segments, circles, triangles = [], [], []
+    for root in model.get('elements', []):
+        for el in descendants(root):
+            geometries = el.get('geometry', [])
+            if isinstance(geometries, dict):
+                geometries = [geometries]
+            for g in geometries:
+                kind = g.get('kind')
+                pts = g.get('points', [])
+                if kind in ('line', 'line_string') and len(pts) >= 2:
+                    for a, b in zip(pts, pts[1:]):
+                        if distance(a, b) > 1e-8:
+                            segments.append({'a': a[:2], 'b': b[:2],
+                                             'id': el.get('id'), 'kind': kind,
+                                             'length': distance(a, b)})
+                    if kind == 'line_string' and len(pts) >= 4 and distance(pts[0], pts[-1]) < 1e-5:
+                        triangles.append({'points': [q[:2] for q in pts], 'id': el.get('id')})
+                elif kind in ('ellipse', 'arc') and g.get('center') is not None:
+                    rx = g.get('primary_radius', g.get('radius'))
+                    ry = g.get('secondary_radius', rx)
+                    if rx is not None and ry is not None and abs(float(rx)-float(ry)) < max(1e-6, float(rx)*0.03):
+                        circles.append({'center': g['center'][:2], 'radius': float(rx),
+                                        'id': el.get('id')})
+
+    if not segments:
+        return None
+    # Reference axis: the long, approximately horizontal baseline through y=0.
+    # For this cell library, that axis is also supported by numerous endpoints.
+    all_x = [v[0] for seg in segments for v in (seg['a'], seg['b'])]
+    span = max(all_x)-min(all_x)
+    tol = max(1e-6, span*1e-5)
+    baseline = [seg for seg in segments
+                if abs(seg['a'][1]-seg['b'][1]) <= tol and seg['length'] >= span*0.1]
+    zero_support = sum(abs(v[1]) <= tol for seg in segments for v in (seg['a'], seg['b']))
+    if zero_support >= 3:
+        axis_y = 0.0
+    elif baseline:
+        axis_y = min(((seg['a'][1]+seg['b'][1])*0.5 for seg in baseline), key=abs)
+    else:
+        # Use dominant endpoint elevation, preferring the cell reference y=0.
+        ys = [v[1] for seg in segments for v in (seg['a'], seg['b'])]
+        axis_y = min(ys, key=lambda y: (sum(abs(y-z) > tol for z in ys), abs(y)))
+
+    candidates = []
+    for stem in segments:
+        a, b = stem['a'], stem['b']
+        if abs(a[0]-b[0]) > max(tol, stem['length']*0.035):
+            continue
+        if abs(a[1]-b[1]) < tol:
+            continue
+        x = (a[0]+b[0])*0.5
+        # Must touch the axis, or end very close to it.
+        gap = max(0.0, min(a[1],b[1])-axis_y, axis_y-max(a[1],b[1]))
+        if gap > max(tol*2, stem['length']*0.08):
+            continue
+        for circle in circles:
+            cx, cy = circle['center']
+            if abs(cx-x) <= max(tol, circle['radius']*0.04) and abs(cy-axis_y) > tol:
+                if min(a[1],b[1])-tol <= cy <= max(a[1],b[1])+tol:
+                    candidates.append((100.0-gap/max(stem['length'],1), x, stem,
+                                       'circle_bisector', circle['id']))
+        for tri in triangles:
+            vertices = tri['points']
+            for u,v in zip(vertices,vertices[1:]):
+                if abs(u[0]-v[0]) <= max(tol,stem['length']*0.035) and abs(u[0]-x) <= max(tol,stem['length']*0.035):
+                    if abs(u[1]-v[1]) >= stem['length']*0.8:
+                        candidates.append((90.0-gap/max(stem['length'],1),x,stem,
+                                           'triangle_vertical_side',tri['id']))
+                        break
+    if candidates:
+        # Prefer the approach-end marker (leftmost in the raw library drawings).
+        candidates.sort(key=lambda c: (-c[0], c[1]))
+        score,x,stem,kind,marker_id=candidates[0]
+        return {'toe_xy_raw':[float(x),float(axis_y)],
+                'through_bearing_deg':0.0,
+                'method':'symbol_perpendicular_intersection',
+                'marker_kind':kind, 'confidence':'estimated',
+                'leader_element_id':stem['id'], 'marker_element_id':marker_id,
+                'through_axis_y_raw':float(axis_y),
+                'candidate_count':len(candidates)}
+
+    longest=max(segments,key=lambda seg:seg['length'])
+    return {'toe_xy_raw':[float(longest['a'][0]),float(longest['a'][1])],
+            'through_bearing_deg':math.degrees(math.atan2(
+                longest['b'][1]-longest['a'][1],longest['b'][0]-longest['a'][0])),
+            'method':'longest_line_endpoint_FALLBACK_UNVERIFIED',
+            'confidence':'low','candidate_count':0}
+
 
 def make_preview_dxf(path, placements, models, scales, meters_per_crs_unit):
     try:import ezdxf
@@ -371,6 +474,7 @@ def run(args):
                         else:
                             rotation=angle(orient['bearing_rad']-math.radians(float(anchor['through_bearing_deg'])))
                             p.update({'anchor_raw':raw,'anchor_method':anchor.get('method','manual'),
+                                       'anchor_confidence':anchor.get('confidence','unknown'),
                                       'rotation_rad':rotation,'rotation_deg':math.degrees(rotation),
                                       'raw_coordinate_scale_m':None,
                                       'status':'preview_ready'})
@@ -494,7 +598,9 @@ def native_place(args, placements, meters_per_crs_unit):
         raise RuntimeError('--write requires an existing --cel library')
     if args.local_origin is not None:
         raise RuntimeError('Local origin requires matching DGN global-origin configuration')
-    ready = [p for p in placements if p['status'] == 'preview_ready']
+    ready = [p for p in placements if p['status'] == 'preview_ready' and
+             (p.get('anchor_method') in ('leader_throughline_intersection', 'symbol_perpendicular_intersection') or
+              args.anchors is not None or args.allow_fallback_anchor)]
     if not ready:
         raise RuntimeError('No placeable switches; see turnout_placement_plan.json')
     import MSPyBentleyGeom
@@ -515,7 +621,8 @@ def native_place(args, placements, meters_per_crs_unit):
     print('Destination meters per storage unit:', dest_meters_per_storage, flush=True)
     print(f'WARNING: Verify destination GCS EPSG:{args.epsg} and global origin; this script does not change either.', flush=True)
     scales = resolve_scales(args.cel, {p['model'] for p in ready}, args.raw_coordinate_kind)
-    print('WARNING: automatic anchors are geometric estimates, not verified switch points.', flush=True)
+    print('WARNING: leader/through-line anchors are geometry estimates; review before production use.', flush=True)
+    print('Eligible cell placements:', len(ready), flush=True)
     from MSPyMstnPlatform import Cell
     for index, p in enumerate(ready, 1):
         name = p['model']
@@ -564,6 +671,8 @@ def main():
     p.add_argument('--text-height',type=float,default=2.0,help='Text height in meters (default: 2)')
     p.add_argument('--angle-line-length',type=float,default=18.0,help='Length of displayed angle rays in meters')
     p.add_argument('--label-offset',type=float,default=5.0,help='Additional label offset beyond rays in meters')
+    p.add_argument('--allow-fallback-anchor',action='store_true',
+                   help='Allow native placement with unverified longest-line fallback anchors')
     p.add_argument('--write',action='store_true',help='Insert native cells into current MicroStation DGN')
     p.add_argument('--local-origin',type=float,nargs=2,help='Diagnostic only; native placement blocked')
     a=p.parse_args()
