@@ -20,42 +20,231 @@ def transform_point(p, scale, rotation, translation, anchor):
     c=math.cos(rotation);s=math.sin(rotation)
     return (translation[0]+c*x-s*y, translation[1]+s*x+c*y)
 
-def osm_arms(node_id, nodes, ways, transformer, reach):
-    arms=[]
+def osm_arms(node_id, nodes, ways, transformer, reach, tangent_window=12.0):
+    """Follow connected OSM ways and fit outward tangents near the requested reach.
+
+    The OSM junction is the estimated point of switch. Bearings are measured
+    from a distal window, rather than the chord from the junction itself.
+    """
+    from collections import defaultdict
+    adjacency = defaultdict(list)
     for way in ways:
-        ids=way.get('nodes',[])
-        for idx, nid in enumerate(ids):
-            if nid!=node_id: continue
-            for direction in (-1,1):
-                j=idx+direction
-                if j<0 or j>=len(ids):continue
-                start=nodes[node_id]
-                origin=transformer.transform(start['lon'],start['lat'])
-                last=None
-                while 0<=j<len(ids) and ids[j] in nodes:
-                    node=nodes[ids[j]]
-                    point=transformer.transform(node['lon'],node['lat'])
-                    if distance(origin,point)>=0.5: last=point
-                    if distance(origin,point)>=reach:break
-                    j+=direction
-                if last is not None:
-                    a=math.atan2(last[1]-origin[1],last[0]-origin[0])
-                    if all(abs(angle(a-other['bearing']))>math.radians(1.5) for other in arms):
-                        arms.append({'bearing':a,'way_id':way['id'],'end':last})
+        ids = way.get('nodes', [])
+        for a, b in zip(ids, ids[1:]):
+            if a in nodes and b in nodes and a != b:
+                adjacency[a].append((b, way['id']))
+                adjacency[b].append((a, way['id']))
+    if node_id not in nodes:
+        return []
+    xy_cache = {}
+    def xy(nid):
+        if nid not in xy_cache:
+            n = nodes[nid]
+            xy_cache[nid] = transformer.transform(n['lon'], n['lat'])
+        return xy_cache[nid]
+    arms = []
+    for neighbor, way_id in adjacency[node_id]:
+        route = [node_id, neighbor]
+        visited = {node_id, neighbor}
+        length = distance(xy(node_id), xy(neighbor))
+        previous, current = node_id, neighbor
+        while length < reach:
+            options = [(n, wid) for n, wid in adjacency[current]
+                       if n != previous and n not in visited]
+            # Stop at another switch or ambiguous branch rather than following
+            # an arbitrary route across a second turnout.
+            if len(options) != 1:
+                break
+            nxt, _ = options[0]
+            length += distance(xy(current), xy(nxt))
+            route.append(nxt)
+            visited.add(nxt)
+            previous, current = current, nxt
+        coords = [xy(n) for n in route]
+        cumulative = [0.0]
+        for a, b in zip(coords, coords[1:]):
+            cumulative.append(cumulative[-1] + distance(a, b))
+        if cumulative[-1] < 1.0:
+            continue
+        end_dist = min(reach, cumulative[-1])
+        start_dist = max(0.0, end_dist - tangent_window)
+        def at(d):
+            for j in range(1, len(cumulative)):
+                if d <= cumulative[j] or j == len(cumulative)-1:
+                    span = cumulative[j]-cumulative[j-1]
+                    t = (d-cumulative[j-1])/span if span else 0.0
+                    return (coords[j-1][0]+t*(coords[j][0]-coords[j-1][0]),
+                            coords[j-1][1]+t*(coords[j][1]-coords[j-1][1]))
+            return coords[-1]
+        start_pt, end_pt = at(start_dist), at(end_dist)
+        if distance(start_pt, end_pt) < 0.5:
+            continue
+        bearing = math.atan2(end_pt[1]-start_pt[1], end_pt[0]-start_pt[0])
+        if all(abs(angle(bearing - other['bearing'])) > math.radians(1.5)
+               for other in arms):
+            arms.append({'bearing':bearing, 'way_id':way_id,
+                         'end':list(end_pt), 'measured_reach':end_dist,
+                         'tangent_window':end_dist-start_dist,
+                         'node_path':route})
     return arms
 
+
 def orientation(arms):
-    if len(arms)<3:return None
-    pairs=sorted((abs(math.pi-abs(angle(a['bearing']-b['bearing']))),i,j)
-                 for i,a in enumerate(arms) for j,b in enumerate(arms) if i<j)
-    err,i,j=pairs[0]
-    other=[k for k in range(len(arms)) if k not in (i,j)]
-    k=min(other,key=lambda z:min(abs(angle(arms[z]['bearing']-arms[i]['bearing'])),abs(angle(arms[z]['bearing']-arms[j]['bearing']))))
-    through=min((i,j),key=lambda z:abs(angle(arms[k]['bearing']-arms[z]['bearing'])))
-    divergence=angle(arms[k]['bearing']-arms[through]['bearing'])
-    return {'bearing_rad':arms[through]['bearing'], 'branch_angle_deg':abs(math.degrees(divergence)),
-            'hand':'LH' if divergence>0 else 'RH','opposition_error_deg':math.degrees(err),
-            'arm_count':len(arms)}
+    if len(arms) < 3:
+        return None
+    pairs = sorted((abs(math.pi-abs(angle(a['bearing']-b['bearing']))),i,j)
+                   for i,a in enumerate(arms) for j,b in enumerate(arms) if i<j)
+    err,i,j = pairs[0]
+    other = [k for k in range(len(arms)) if k not in (i,j)]
+    k = min(other, key=lambda z: min(abs(angle(arms[z]['bearing']-arms[i]['bearing'])),
+                                     abs(angle(arms[z]['bearing']-arms[j]['bearing']))))
+    through = min((i,j), key=lambda z: abs(angle(arms[k]['bearing']-arms[z]['bearing'])))
+    divergence = angle(arms[k]['bearing']-arms[through]['bearing'])
+    return {'bearing_rad':arms[through]['bearing'],
+            'branch_bearing_rad':arms[k]['bearing'],
+            'branch_angle_deg':abs(math.degrees(divergence)),
+            'hand':'LH' if divergence>0 else 'RH',
+            'opposition_error_deg':math.degrees(err),
+            'arm_count':len(arms),
+            'angle_method':'distal_tangent_window_from_osm_split',
+            'through_arm':arms[through], 'branch_arm':arms[k]}
+
+
+def angle_annotation(placement, meters_per_crs_unit, length_m=18.0, offset_m=5.0):
+    """Display distal fitted tangents at their actual measurement locations.
+
+    The lines are not falsely anchored at the OSM switch node. Their infinite
+    extensions may intersect near the PS; this intersection is reported only.
+    """
+    rays = []
+    for key in ('through_arm', 'branch_arm'):
+        arm = placement[key]
+        bearing = arm['bearing']
+        end = arm['end']
+        window = arm['tangent_window']
+        start = [end[0] - window * math.cos(bearing),
+                 end[1] - window * math.sin(bearing)]
+        # The exact line used to measure the angle, not a displaced ray.
+        rays.append([start, list(end)])
+    a = placement['bearing_rad']
+    b = placement['branch_bearing_rad']
+    mid = a + angle(b - a) / 2.0
+    xy = placement['target_xy']
+    offset = (length_m + offset_m) / meters_per_crs_unit
+    label_xy = [xy[0] + offset * math.cos(mid),
+                xy[1] + offset * math.sin(mid)]
+    observed = placement['branch_angle_deg']
+    estimated = (1.0 / (2.0 * math.tan(math.radians(observed) / 2.0))
+                 if 0.05 < observed < 90 else None)
+    nearest = round(estimated) if estimated is not None else None
+    label = (f'No. {nearest} (est.) | {observed:.2f} deg {placement["hand"]}'
+             if nearest is not None else f'{observed:.2f} deg {placement["hand"]}')
+    return {'rays': rays, 'label_xy': label_xy, 'label': label,
+            'estimated_frog_number': estimated, 'nearest_frog_number': nearest,
+            'measurement_method': 'actual_distal_tangent_windows'}
+
+
+def write_native_annotations(args, placements, meters_per_crs_unit):
+    """Write labels first, then the measured tangent segments; log each insertion."""
+    import traceback
+    import MSPyBentleyGeom
+    import MSPyDgnPlatform
+    import MSPyMstnPlatform
+    from MSPyMstnPlatform import ISessionMgr
+    from MSPyDgnPlatform import EditElementHandle, LineHandler, TextBlock, TextElemHandler
+    from MSPyBentleyGeom import DPoint3d, DSegment3d
+
+    ref = ISessionMgr.GetActiveDgnModelRef()
+    if ref is None:
+        raise RuntimeError('No active DGN model reference')
+    model = ref.GetDgnModel()
+    if model is None:
+        raise RuntimeError('No active DGN model')
+    factor = float(model.GetModelInfo().GetUorPerMeter()) * meters_per_crs_unit
+    if not math.isfinite(factor) or factor <= 0:
+        raise RuntimeError('Invalid destination coordinate scale')
+    print('Annotation destination:', model.GetModelName(), 'EPSG:', args.epsg, flush=True)
+    print('Verify destination DGN GCS matches --epsg; no automatic GCS change.', flush=True)
+
+    def point(xy):
+        return DPoint3d(float(xy[0])*factor, float(xy[1])*factor, 0.0)
+
+    def inserted_id(handle):
+        try:
+            return str(handle.GetElementId())
+        except (AttributeError, TypeError) as exc:
+            return 'unavailable (' + str(exc) + ')'
+
+    def add_line(a, b, kind):
+        handle = EditElementHandle()
+        status = LineHandler.CreateLineElement(
+            handle, None, DSegment3d(point(a), point(b)), ref.Is3d(), ref)
+        if not success(status):
+            raise RuntimeError(kind + ' CreateLineElement failed: ' + str(status))
+        added = handle.AddToModel()
+        if added is not None and not success(added):
+            raise RuntimeError(kind + ' AddToModel failed: ' + str(added))
+        print(kind, 'AddToModel=', added, 'element_id=', inserted_id(handle),
+              'start=', a, 'end=', b, flush=True)
+        return inserted_id(handle)
+
+    def add_text(label, xy):
+        # TextBlock's constructor requires a DgnModel, not a DgnModelRef.
+        block = TextBlock(model)
+        block.SetUserOrigin(point(xy))
+        # Set text size explicitly if the installed binding exposes these
+        # Bentley text-run APIs. Otherwise report the inherited style.
+        text_height_uor = float(args.text_height) * float(model.GetModelInfo().GetUorPerMeter())
+        try:
+            from MSPyBentleyGeom import DPoint2d
+            props = block.GetRunPropertiesForAdd()
+            props.SetFontSize(DPoint2d(text_height_uor, text_height_uor))
+            print('Text height set to', args.text_height, 'meters', flush=True)
+        except (AttributeError, TypeError) as exc:
+            print('WARNING: explicit text height not supported by this binding:',
+                  repr(exc), '; using active text style', flush=True)
+        block.AppendText(label)
+        handle = EditElementHandle()
+        creation = TextElemHandler.CreateElement(handle, None, block)
+        print('TextElemHandler.CreateElement returned:', repr(creation), flush=True)
+        if creation is None:
+            raise RuntimeError('TextElemHandler.CreateElement returned None')
+        # The return type is TextBlockToElementResult, NOT BentleyStatus.
+        # Avoid guessing its enum values; AddToModel is checked separately.
+        added = handle.AddToModel()
+        if added is not None and not success(added):
+            raise RuntimeError('Text AddToModel failed: ' + str(added))
+        eid = inserted_id(handle)
+        print('TEXT AddToModel=', added, 'element_id=', eid,
+              'location=', xy, 'label=', label, flush=True)
+        return eid
+
+    completed = 0
+    for placement in placements:
+        ann = placement.get('angle_annotation')
+        if ann is None:
+            continue
+        stage = 'text'
+        node_id = placement['node_id']
+        try:
+            print('Node', node_id, 'creating label first:', ann['label'], flush=True)
+            text_id = add_text(ann['label'], ann['label_xy'])
+            line_ids = []
+            for i, (start, end) in enumerate(ann['rays'], 1):
+                stage = 'tangent line ' + str(i)
+                line_ids.append(add_line(start, end, stage))
+            placement['annotation_element_ids'] = {'text': text_id, 'lines': line_ids}
+            completed += 1
+            print('Annotation complete:', completed, 'node:', node_id, flush=True)
+        except Exception as exc:
+            print('ANNOTATION FAILED node=', node_id, 'stage=', stage,
+                  'error=', type(exc).__name__, str(exc), flush=True)
+            traceback.print_exc()
+            raise RuntimeError(
+                'Annotation failed at node %s during %s: %s: %s. '
+                'Some elements may have been inserted; remove them before rerunning.'
+                % (node_id, stage, type(exc).__name__, exc)) from exc
+    print('Native angle annotations completed:', completed, flush=True)
 
 def geometry_iter(obj):
     if isinstance(obj,dict):
@@ -160,10 +349,16 @@ def run(args):
         elif name not in models:p['status']='missing_cell_model'
         else:
             xy=proj.transform(node['lon'],node['lat']);p['target_xy']=list(xy)
-            orient=orientation(osm_arms(nid,nodes,ways,proj,args.arm_reach / meters_per_crs_unit))
+            orient=orientation(osm_arms(nid,nodes,ways,proj,
+                args.arm_reach / meters_per_crs_unit,
+                args.tangent_window / meters_per_crs_unit))
             if orient is None:p['status']='insufficient_osm_arms'
             else:
                 p.update(orient)
+                p['estimated_ps_xy'] = list(xy)
+                p['angle_annotation'] = angle_annotation(p, meters_per_crs_unit, args.angle_line_length, args.label_offset)
+                p['observed_angle_label'] = (
+                    f"SW {nid} | {orient['branch_angle_deg']:.2f} deg {orient['hand']}")
                 cell_hand='LH' if 'LH' in name.split() else ('RH' if 'RH' in name.split() else None)
                 if cell_hand and cell_hand!=orient['hand']:p['status']='hand_mismatch'
                 else:
@@ -182,7 +377,7 @@ def run(args):
         placements.append(p)
         print(f'[{i}/{len(rankings)}] OSM {nid}: {name}: {p["status"]}',flush=True)
     report={'schema':'turnout_placement_v2','epsg':args.epsg,'meters_per_crs_unit':meters_per_crs_unit,'source_osm':str(args.osm),
-            'source_geometry':str(args.geometry),'scale_note':'Scale resolved from source cell model at native placement time; source raw geometry assumed UOR.',
+            'source_geometry':str(args.geometry),'angle_note':'OSM split approximates PS; angle measured between distal branch and through tangents, not the frog angle.', 'scale_note':'Scale resolved from source cell model at native placement time; source raw geometry assumed UOR.',
             'placements':placements}
     args.out.parent.mkdir(parents=True,exist_ok=True)
     args.out.write_text(json.dumps(report,indent=2),encoding='utf-8')
@@ -192,6 +387,8 @@ def run(args):
         scales = resolve_scales(args.cel, {p['model'] for p in placements if p['status']=='preview_ready'}, args.raw_coordinate_kind)
         make_preview_dxf(args.preview_dxf,placements,models,scales,meters_per_crs_unit)
         print('Saved DXF preview:',args.preview_dxf,flush=True)
+    if args.annotate:
+        write_native_annotations(args, placements, meters_per_crs_unit)
     if args.write:
         native_place(args, placements, meters_per_crs_unit)
     return report
@@ -357,11 +554,16 @@ def main():
     p.add_argument('--node',type=int)
     p.add_argument('--model',help='Override ranked model')
     p.add_argument('--max-turnouts',type=int,default=1)
-    p.add_argument('--arm-reach',type=float,default=25.0)
+    p.add_argument('--arm-reach',type=float,default=25.0,help='Distance from estimated PS to tangent measurement (meters)')
+    p.add_argument('--tangent-window',type=float,default=12.0,help='Length of distal tangent fitting window (meters)')
     p.add_argument('--raw-coordinate-kind', choices=('uor','storage'), default='uor',
                    help='Interpret extracted JSON coordinates as source UOR (default) or source storage units')
     p.add_argument('--out',type=Path,default=HERE/'turnout_placement_plan.json')
     p.add_argument('--preview-dxf',type=Path,help='Create transformed cell-geometry preview DXF')
+    p.add_argument('--annotate',action='store_true',help='Write two measured tangents and a native text label')
+    p.add_argument('--text-height',type=float,default=2.0,help='Text height in meters (default: 2)')
+    p.add_argument('--angle-line-length',type=float,default=18.0,help='Length of displayed angle rays in meters')
+    p.add_argument('--label-offset',type=float,default=5.0,help='Additional label offset beyond rays in meters')
     p.add_argument('--write',action='store_true',help='Insert native cells into current MicroStation DGN')
     p.add_argument('--local-origin',type=float,nargs=2,help='Diagnostic only; native placement blocked')
     a=p.parse_args()
@@ -370,6 +572,9 @@ def main():
     if a.preview_dxf is not None:
         a.preview_dxf = HERE / a.preview_dxf.name
     if a.max_turnouts is not None and a.max_turnouts<1:p.error('--max-turnouts must be >=1')
+    if a.angle_line_length <= 0 or a.label_offset < 0:p.error('annotation length must be positive and label offset nonnegative')
+    if a.arm_reach <= 0 or a.tangent_window <= 0:p.error('arm reach and tangent window must be positive')
+    if a.text_height <= 0:p.error('--text-height must be positive')
     run(a)
 
 if __name__=='__main__':main()
